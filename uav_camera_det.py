@@ -5,6 +5,7 @@ from cv_bridge import CvBridge
 import time
 import os
 import json
+import cv2
 import requests
 from ultralytics import YOLO
 
@@ -28,6 +29,11 @@ class UAVCameraDetector(Node):
         self.backend_origin = os.getenv('BACKEND_ORIGIN')
         self.backend_url = self.backend_origin + '/receive_detection'
         self.get_logger().info(f"Backend URL set to: {self.backend_url}")
+
+        self.show_window = os.getenv('UAV_CAMERA_SHOW', '1') != '0'
+        if self.show_window:
+            cv2.namedWindow('UAV YOLO', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('UAV YOLO', 960, 540)
 
     def image_callback(self, msg):
         self.get_logger().info("Image received")
@@ -76,6 +82,11 @@ class UAVCameraDetector(Node):
             },
             "detections": formatted_detections
         }
+
+        if self.show_window:
+            annotated = result.plot()
+            cv2.imshow('UAV YOLO', annotated)
+            cv2.waitKey(1)
 
         self.get_logger().info("Sending detection payload to backend...")
         self.get_logger().debug(json.dumps(payload, indent=2))

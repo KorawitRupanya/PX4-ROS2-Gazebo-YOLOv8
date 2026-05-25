@@ -1,5 +1,11 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import time
@@ -8,6 +14,8 @@ import json
 import cv2
 import requests
 from ultralytics import YOLO
+
+from px4_msgs.msg import VehicleLocalPosition
 
 # OpenTelemetry — set up at module load so RequestsInstrumentor wraps every
 # outbound POST. The W3C traceparent header is injected automatically, so the
@@ -57,6 +65,32 @@ class UAVCameraDetector(Node):
         if self.show_window:
             cv2.namedWindow('UAV YOLO', cv2.WINDOW_NORMAL)
             cv2.resizeWindow('UAV YOLO', 960, 540)
+
+        # Latest drone NED pose (None until first lpos arrives).
+        self.pose = None
+        lpos_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.create_subscription(
+            VehicleLocalPosition,
+            '/fmu/out/vehicle_local_position',
+            self._on_lpos,
+            lpos_qos,
+        )
+
+    def _on_lpos(self, msg):
+        if not (msg.xy_valid and msg.z_valid):
+            return
+        self.pose = {
+            "n": float(msg.x),
+            "e": float(msg.y),
+            "d": float(msg.z),
+            "yaw": float(msg.heading),
+            "valid": True,
+        }
 
     def image_callback(self, msg):
         with tracer.start_as_current_span("drone.frame") as frame_span:
@@ -113,6 +147,7 @@ class UAVCameraDetector(Node):
                     "inference": round(speed_info['inference'], 2),
                     "postprocess": round(speed_info['postprocess'], 2)
                 },
+                "pose": self.pose,
                 "detections": formatted_detections
             }
 

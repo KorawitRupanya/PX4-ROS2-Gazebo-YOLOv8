@@ -9,6 +9,29 @@ import cv2
 import requests
 from ultralytics import YOLO
 
+# OpenTelemetry — set up at module load so RequestsInstrumentor wraps every
+# outbound POST. The W3C traceparent header is injected automatically, so the
+# backend's /receive_detection span chains to ours.
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+
+SERVICE_NAME = "drone_yolo_service"
+OTEL_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT_GRPC")
+
+_resource = Resource(attributes={"service.name": SERVICE_NAME})
+_provider = TracerProvider(resource=_resource)
+if OTEL_ENDPOINT:
+    _provider.add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter(endpoint=OTEL_ENDPOINT, insecure=True))
+    )
+trace.set_tracer_provider(_provider)
+tracer = trace.get_tracer(__name__)
+RequestsInstrumentor().instrument()
+
 class UAVCameraDetector(Node):
     def __init__(self):
         super().__init__('uav_camera_detector')
@@ -36,66 +59,80 @@ class UAVCameraDetector(Node):
             cv2.resizeWindow('UAV YOLO', 960, 540)
 
     def image_callback(self, msg):
-        self.get_logger().info("Image received")
+        with tracer.start_as_current_span("drone.frame") as frame_span:
+            frame_span.set_attribute("drone.id", 1)
+            self.get_logger().info("Image received")
 
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as e:
-            self.get_logger().error(f"cv_bridge conversion failed: {e}")
-            return
+            try:
+                cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            except Exception as e:
+                frame_span.set_attribute("outcome", "cv_bridge_error")
+                frame_span.record_exception(e)
+                self.get_logger().error(f"cv_bridge conversion failed: {e}")
+                return
 
-        try:
-            start_time = time.time()
-            results = self.model(cv_image)
-            end_time = time.time()
-            self.get_logger().info("YOLO inference completed")
-        except Exception as e:
-            self.get_logger().error(f"YOLO inference failed: {e}")
-            return
+            try:
+                with tracer.start_as_current_span("drone.yolo_inference") as inf_span:
+                    start_time = time.time()
+                    results = self.model(cv_image)
+                    end_time = time.time()
+                    inf_span.set_attribute("inference.duration_ms", round((end_time - start_time) * 1000, 2))
+                self.get_logger().info("YOLO inference completed")
+            except Exception as e:
+                frame_span.set_attribute("outcome", "yolo_error")
+                frame_span.record_exception(e)
+                self.get_logger().error(f"YOLO inference failed: {e}")
+                return
 
-        result = results[0]
-        speed_info = result.speed
-        detections = result.boxes
+            result = results[0]
+            speed_info = result.speed
+            detections = result.boxes
 
-        formatted_detections = []
-        if detections and len(detections.xyxy) > 0:
-            for i, box in enumerate(detections.xyxy):
-                x1, y1, x2, y2 = map(float, box[:4])
-                conf = float(detections.conf[i])
-                cls = int(detections.cls[i])
-                label = self.model.names.get(cls, f"class_{cls}")
-                formatted_detections.append({
-                    "class_id": cls,
-                    "class_name": label,
-                    "confidence": round(conf, 4),
-                    "bbox": [x1, y1, x2, y2]
-                })
+            formatted_detections = []
+            if detections and len(detections.xyxy) > 0:
+                for i, box in enumerate(detections.xyxy):
+                    x1, y1, x2, y2 = map(float, box[:4])
+                    conf = float(detections.conf[i])
+                    cls = int(detections.cls[i])
+                    label = self.model.names.get(cls, f"class_{cls}")
+                    formatted_detections.append({
+                        "class_id": cls,
+                        "class_name": label,
+                        "confidence": round(conf, 4),
+                        "bbox": [x1, y1, x2, y2]
+                    })
 
-        payload = {
-            "drone_id": 1,
-            "timestamp": time.time(),
-            "inference_time_ms": round((end_time - start_time) * 1000, 2),
-            "speed": {
-                "preprocess": round(speed_info['preprocess'], 2),
-                "inference": round(speed_info['inference'], 2),
-                "postprocess": round(speed_info['postprocess'], 2)
-            },
-            "detections": formatted_detections
-        }
+            frame_span.set_attribute("detection.count", len(formatted_detections))
 
-        if self.show_window:
-            annotated = result.plot()
-            cv2.imshow('UAV YOLO', annotated)
-            cv2.waitKey(1)
+            payload = {
+                "drone_id": 1,
+                "timestamp": time.time(),
+                "inference_time_ms": round((end_time - start_time) * 1000, 2),
+                "speed": {
+                    "preprocess": round(speed_info['preprocess'], 2),
+                    "inference": round(speed_info['inference'], 2),
+                    "postprocess": round(speed_info['postprocess'], 2)
+                },
+                "detections": formatted_detections
+            }
 
-        self.get_logger().info("Sending detection payload to backend...")
-        self.get_logger().debug(json.dumps(payload, indent=2))
+            if self.show_window:
+                annotated = result.plot()
+                cv2.imshow('UAV YOLO', annotated)
+                cv2.waitKey(1)
 
-        try:
-            response = requests.post(self.backend_url, json=payload, timeout=2)
-            self.get_logger().info(f"Backend response: {response.status_code} - {response.text}")
-        except Exception as e:
-            self.get_logger().error(f"Failed to send detection to backend: {e}")
+            self.get_logger().info("Sending detection payload to backend...")
+            self.get_logger().debug(json.dumps(payload, indent=2))
+
+            try:
+                response = requests.post(self.backend_url, json=payload, timeout=2)
+                frame_span.set_attribute("backend.status_code", response.status_code)
+                frame_span.set_attribute("outcome", "posted")
+                self.get_logger().info(f"Backend response: {response.status_code} - {response.text}")
+            except Exception as e:
+                frame_span.set_attribute("outcome", "post_error")
+                frame_span.record_exception(e)
+                self.get_logger().error(f"Failed to send detection to backend: {e}")
 
 def main(args=None):
     rclpy.init(args=args)

@@ -30,7 +30,13 @@ from opentelemetry.instrumentation.requests import RequestsInstrumentor
 SERVICE_NAME = "drone_yolo_service"
 OTEL_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT_GRPC")
 
-_resource = Resource(attributes={"service.name": SERVICE_NAME})
+# Swarm identity. DRONE_ID labels every detection/span; DRONE_NS is the PX4
+# uXRCE-DDS namespace (e.g. "px4_1") so a per-drone node subscribes to that
+# vehicle's topics. Defaults reproduce the single-drone (un-namespaced) path.
+DRONE_ID = int(os.getenv("DRONE_ID", "1"))
+DRONE_NS = os.getenv("DRONE_NS", "").strip("/")
+
+_resource = Resource(attributes={"service.name": SERVICE_NAME, "drone.id": DRONE_ID})
 _provider = TracerProvider(resource=_resource)
 if OTEL_ENDPOINT:
     _provider.add_span_processor(
@@ -42,8 +48,15 @@ RequestsInstrumentor().instrument()
 
 class UAVCameraDetector(Node):
     def __init__(self):
-        super().__init__('uav_camera_detector')
+        super().__init__(f'uav_camera_detector_{DRONE_ID}')
         self.bridge = CvBridge()
+        self.drone_id = DRONE_ID
+
+        # Per-drone topic prefix. Empty namespace keeps the legacy relative
+        # 'camera' / '/fmu/...' topics; a namespace (e.g. px4_1) scopes both.
+        pfx = f"/{DRONE_NS}" if DRONE_NS else ""
+        camera_topic = os.getenv("CAMERA_TOPIC") or (f"{pfx}/camera" if DRONE_NS else "camera")
+        lpos_topic = f"{pfx}/fmu/out/vehicle_local_position"
 
         # Load YOLO model
         self.model = YOLO('yolov8n.pt')  # Adjust path if needed
@@ -51,10 +64,11 @@ class UAVCameraDetector(Node):
         # Subscribe to ROS image topic
         self.subscription = self.create_subscription(
             Image,
-            'camera',  # Adjust topic name if needed
+            camera_topic,
             self.image_callback,
             10)
-        self.get_logger().info("YOLO node initialized and subscribed to 'camera' topic")
+        self.get_logger().info(
+            f"YOLO node (drone {DRONE_ID}, ns='{DRONE_NS or '-'}') subscribed to '{camera_topic}'")
 
         # Backend detection receiver endpoint
         self.backend_origin = os.getenv('BACKEND_ORIGIN')
@@ -76,7 +90,7 @@ class UAVCameraDetector(Node):
         )
         self.create_subscription(
             VehicleLocalPosition,
-            '/fmu/out/vehicle_local_position',
+            lpos_topic,
             self._on_lpos,
             lpos_qos,
         )
@@ -94,7 +108,7 @@ class UAVCameraDetector(Node):
 
     def image_callback(self, msg):
         with tracer.start_as_current_span("drone.frame") as frame_span:
-            frame_span.set_attribute("drone.id", 1)
+            frame_span.set_attribute("drone.id", self.drone_id)
             self.get_logger().info("Image received")
 
             try:
@@ -139,7 +153,7 @@ class UAVCameraDetector(Node):
             frame_span.set_attribute("detection.count", len(formatted_detections))
 
             payload = {
-                "drone_id": 1,
+                "drone_id": self.drone_id,
                 "timestamp": time.time(),
                 "inference_time_ms": round((end_time - start_time) * 1000, 2),
                 "speed": {

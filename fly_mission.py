@@ -23,6 +23,7 @@ Usage:
 """
 
 import json
+import os
 import sys
 import time
 
@@ -58,8 +59,16 @@ def main(argv):
         print("mission has no waypoints", file=sys.stderr)
         sys.exit(1)
 
+    # Swarm identity. DRONE_NS is the PX4 uXRCE-DDS namespace (e.g. "px4_1") so
+    # this mission node drives that vehicle's topics; MAV_SYS_ID is the vehicle's
+    # MAVLink system id (idx+1). Defaults reproduce the single-drone path:
+    # empty namespace → legacy '/fmu/...' topics, sysid 1.
+    drone_ns = os.getenv("DRONE_NS", "").strip("/")
+    sys_id = int(os.getenv("MAV_SYS_ID", "1"))
+    pfx = f"/{drone_ns}" if drone_ns else ""
+
     rclpy.init()
-    node = rclpy.create_node("fly_mission")
+    node = rclpy.create_node(f"fly_mission_{sys_id}")
     pub_qos = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
         durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -72,9 +81,9 @@ def main(argv):
         history=HistoryPolicy.KEEP_LAST,
         depth=1,
     )
-    mode_pub = node.create_publisher(OffboardControlMode, "/fmu/in/offboard_control_mode", pub_qos)
-    sp_pub = node.create_publisher(TrajectorySetpoint, "/fmu/in/trajectory_setpoint", pub_qos)
-    cmd_pub = node.create_publisher(VehicleCommand, "/fmu/in/vehicle_command", pub_qos)
+    mode_pub = node.create_publisher(OffboardControlMode, f"{pfx}/fmu/in/offboard_control_mode", pub_qos)
+    sp_pub = node.create_publisher(TrajectorySetpoint, f"{pfx}/fmu/in/trajectory_setpoint", pub_qos)
+    cmd_pub = node.create_publisher(VehicleCommand, f"{pfx}/fmu/in/vehicle_command", pub_qos)
 
     state = {"n": 0.0, "e": 0.0, "d": 0.0, "fix": False}
 
@@ -86,7 +95,7 @@ def main(argv):
 
     node.create_subscription(
         VehicleLocalPosition,
-        "/fmu/out/vehicle_local_position",
+        f"{pfx}/fmu/out/vehicle_local_position",
         on_lpos,
         sub_qos,
     )
@@ -104,9 +113,9 @@ def main(argv):
         msg.command = command
         msg.param1 = param1
         msg.param2 = param2
-        msg.target_system = 1
+        msg.target_system = sys_id
         msg.target_component = 1
-        msg.source_system = 1
+        msg.source_system = sys_id
         msg.source_component = 1
         msg.from_external = True
         msg.timestamp = now_us()

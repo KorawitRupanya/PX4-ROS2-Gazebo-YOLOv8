@@ -17,6 +17,12 @@ from ultralytics import YOLO
 
 from px4_msgs.msg import VehicleLocalPosition
 
+try:
+    from resource_probe import stamp as stamp_resources  # GPU/CPU/RAM/net on drone.frame
+except Exception:  # keep the node working if the probe (or psutil/pynvml) is absent
+    def stamp_resources(span):
+        return None
+
 # OpenTelemetry — set up at module load so RequestsInstrumentor wraps every
 # outbound POST. The W3C traceparent header is injected automatically, so the
 # backend's /receive_detection span chains to ours.
@@ -109,6 +115,7 @@ class UAVCameraDetector(Node):
     def image_callback(self, msg):
         with tracer.start_as_current_span("drone.frame") as frame_span:
             frame_span.set_attribute("drone.id", self.drone_id)
+            stamp_resources(frame_span)  # shared-GPU util/mem + host CPU/RAM/net
             self.get_logger().info("Image received")
 
             try:
